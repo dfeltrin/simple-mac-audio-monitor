@@ -21,7 +21,6 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .tint(MonitorTheme.accent)
         .task { monitor.refreshDevices() }
-        .onChange(of: monitor.selectedDeviceID) { _, _ in monitor.selectDevice() }
         .onChange(of: monitor.volume) { _, _ in monitor.applyVolume() }
         .onChange(of: isCollapsed) { _, _ in showsDevicePicker = false }
         .alert("Other apps audio", isPresented: Binding(
@@ -72,7 +71,7 @@ struct ContentView: View {
             Spacer()
             HStack(spacing: 5) {
                 StatusDot(isLive: monitor.isMonitoring)
-                Text(monitor.isMonitoring ? "LIVE" : "READY")
+                Text(monitor.isReconnecting ? "RECONNECTING" : monitor.isMonitoring ? "LIVE" : "READY")
                     .font(MonitorTheme.label(9))
             }
             .foregroundStyle(monitor.isMonitoring ? MonitorTheme.accent : MonitorTheme.secondary)
@@ -90,8 +89,11 @@ struct ContentView: View {
                 Spacer()
                 Button { monitor.refreshDevices() } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11, weight: .medium)).foregroundStyle(MonitorTheme.secondary)
-                        .frame(width: 26, height: 24).contentShape(Rectangle())
+                        .font(.system(size: 16, weight: .semibold)).foregroundStyle(MonitorTheme.text)
+                        .frame(width: 44, height: 38)
+                        .background(MonitorTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay { RoundedRectangle(cornerRadius: 8).stroke(MonitorTheme.border, lineWidth: 1) }
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(MonitorButtonStyle())
                 .help("Refresh input devices").accessibilityLabel("Refresh input devices")
@@ -158,7 +160,7 @@ struct ContentView: View {
                     VStack(spacing: 4) {
                         ForEach(monitor.devices) { device in
                             Button {
-                                monitor.selectedDeviceID = device.id
+                                monitor.selectDevice(device)
                                 showsDevicePicker = false
                             } label: {
                                 HStack(alignment: .top, spacing: 8) {
@@ -234,7 +236,8 @@ struct ContentView: View {
                 volumeStrip(title: "Monitor", subtitle: "Your instrument", icon: "waveform",
                             value: $monitor.volume, color: MonitorTheme.accent,
                             enabled: true, active: monitor.isMonitoring,
-                            canToggle: hasInput || monitor.isMonitoring,
+                            reconnecting: monitor.isReconnecting,
+                            canToggle: hasInput || monitor.isMonitoring || monitor.isReconnecting,
                             action: { monitor.toggleMonitoring() })
                 volumeStrip(title: "Other apps", subtitle: "Music & playback", icon: "music.note",
                             value: $otherApps.volume, color: MonitorTheme.apps,
@@ -246,9 +249,12 @@ struct ContentView: View {
     }
 
     private func volumeStrip(title: String, subtitle: String, icon: String, value: Binding<Float>,
-                             color: Color, enabled: Bool, active: Bool, canToggle: Bool,
+                             color: Color, enabled: Bool, active: Bool, reconnecting: Bool = false, canToggle: Bool,
                              action: @escaping () -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let controlIcon = reconnecting ? "xmark" : active ? "pause.fill" : "power"
+        let controlTitle = reconnecting ? "Cancel" : active ? "Enabled" : "Enable"
+        let controlLabel = reconnecting ? "Cancel reconnection" : "\(active ? "Disable" : "Enable") \(title.lowercased())"
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 7) {
                 Image(systemName: icon).font(.system(size: 12, weight: .semibold)).foregroundStyle(color)
                 Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(MonitorTheme.text)
@@ -265,8 +271,8 @@ struct ContentView: View {
                 .disabled(!enabled).opacity(enabled ? 1 : 0.45)
             Button(action: action) {
                 HStack(spacing: 6) {
-                    Image(systemName: active ? "pause.fill" : "power").font(.system(size: 9, weight: .bold))
-                    Text(active ? "Enabled" : "Enable").font(.system(size: 11, weight: .semibold))
+                    Image(systemName: controlIcon).font(.system(size: 9, weight: .bold))
+                    Text(controlTitle).font(.system(size: 11, weight: .semibold))
                 }
                 .foregroundStyle(active ? color : MonitorTheme.text)
                 .frame(maxWidth: .infinity).frame(height: 32)
@@ -276,9 +282,9 @@ struct ContentView: View {
             }
             .buttonStyle(MonitorButtonStyle()).disabled(!canToggle)
             .padding(.top, 16)
-            .accessibilityLabel((active ? "Disable " : "Enable ") + title.lowercased())
+            .accessibilityLabel(controlLabel)
             .accessibilityAddTraits(active ? .isSelected : [])
-            .help(!canToggle && title == "Other apps" ? "Requires macOS 14.2 or later" : (active ? "Disable " : "Enable ") + title.lowercased())
+            .help(!canToggle && title == "Other apps" ? "Requires macOS 14.2 or later" : controlLabel)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -305,7 +311,8 @@ struct ContentView: View {
     private var compactPanel: some View {
         VStack(spacing: 0) {
             StatusDot(isLive: monitor.isMonitoring).padding(.top, 22)
-            Text(monitor.isMonitoring ? "LIVE" : "IDLE").font(MonitorTheme.label(6))
+            Text(monitor.isReconnecting ? "WAIT" : monitor.isMonitoring ? "LIVE" : "IDLE")
+                .font(MonitorTheme.label(6))
                 .foregroundStyle(monitor.isMonitoring ? MonitorTheme.live : MonitorTheme.secondary).padding(.top, 9)
             Spacer()
             DockHandle(isCollapsed: true) { isCollapsed = false }
@@ -372,20 +379,47 @@ private struct DockHandle: View {
 private struct SignalMeter: View {
     let label: String
     let level: Float
+
+    private let segmentCount = 14
+
     var body: some View {
         HStack(spacing: 5) {
             Text(label).font(MonitorTheme.label(8)).foregroundStyle(MonitorTheme.secondary)
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(MonitorTheme.accent.opacity(0.1))
-                    Capsule().fill(level > 0.9 ? MonitorTheme.amber : MonitorTheme.accent)
-                        .frame(width: max(0, min(1, CGFloat(level))) * geometry.size.width)
+            HStack(spacing: 2) {
+                ForEach(0..<segmentCount, id: \.self) { index in
+                    let intensity = Double(min(1, max(0, level * Float(segmentCount) - Float(index))))
+                    let color = segmentColor(at: index)
+                    let lens = RoundedRectangle(cornerRadius: 1)
+                    lens.fill(.black)
+                        .overlay {
+                            lens.fill(LinearGradient(
+                                colors: [color.opacity(0.16 + 0.84 * intensity),
+                                         color.opacity(0.05 + 0.60 * intensity)],
+                                startPoint: .top, endPoint: .bottom
+                            ))
+                        }
+                        .overlay {
+                            lens.strokeBorder(.white.opacity(0.07 + 0.12 * intensity), lineWidth: 0.5)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .shadow(color: color.opacity(0.22 * intensity), radius: 1)
                 }
             }
-            .frame(height: 4)
+            .frame(height: 8)
+            .padding(2)
+            .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 3))
+            .overlay { RoundedRectangle(cornerRadius: 3).strokeBorder(MonitorTheme.border, lineWidth: 0.5) }
         }
         .accessibilityElement(children: .ignore).accessibilityLabel(label + " monitor level")
         .accessibilityValue("\(Int((level * 100).rounded())) percent")
+    }
+
+    private func segmentColor(at index: Int) -> Color {
+        switch index {
+        case (segmentCount - 1): Color(red: 1, green: 0.25, blue: 0.16)
+        case (segmentCount - 3)..<(segmentCount - 1): Color(red: 1, green: 0.72, blue: 0.14)
+        default: Color(red: 0.39, green: 0.88, blue: 0.22)
+        }
     }
 }
 

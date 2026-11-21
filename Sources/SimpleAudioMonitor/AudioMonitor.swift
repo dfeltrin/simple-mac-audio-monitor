@@ -13,9 +13,7 @@ struct InputDevice: Identifiable, Hashable {
 @MainActor
 final class AudioMonitor: ObservableObject {
     @Published private(set) var devices: [InputDevice] = []
-    @Published var selectedDeviceID: AudioDeviceID = 0 {
-        didSet { saveSelectedDevice() }
-    }
+    @Published private(set) var selectedDeviceID: AudioDeviceID = 0
     @Published private(set) var availableChannels: [Int] = []
     @Published var selectedChannel = 1 {
         didSet { defaults.set(selectedChannel, forKey: PreferenceKey.selectedChannel) }
@@ -29,18 +27,18 @@ final class AudioMonitor: ObservableObject {
     @Published private(set) var leftOutputLevel: Float = 0
     @Published private(set) var rightOutputLevel: Float = 0
     @Published private(set) var isMonitoring = false
+    @Published private(set) var isReconnecting = false
     @Published var showError = false
     @Published private(set) var errorMessage = ""
 
-    private let engine = AVAudioEngine()
-    private let monitorMixer = AVAudioMixerNode()
-    private let meterState = MeterState()
+    private var route: MonitorRoute?
+    private var recovery: Task<Void, Never>?
     private var meterRefreshTimer: Timer?
+    private var routeCheckTimer: Timer?
     private var sleepObserver: NSObjectProtocol?
     private let defaults = UserDefaults.standard
 
     init() {
-        engine.attach(monitorMixer)
         if defaults.object(forKey: PreferenceKey.volume) != nil {
             volume = defaults.float(forKey: PreferenceKey.volume)
         }
@@ -51,6 +49,11 @@ final class AudioMonitor: ObservableObject {
         meterRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshMeter()
+            }
+        }
+        routeCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkRoute()
             }
         }
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -66,18 +69,26 @@ final class AudioMonitor: ObservableObject {
 
     func refreshDevices() {
         devices = Self.inputDevices()
-        let savedUID = defaults.string(forKey: PreferenceKey.deviceUID)
-        let savedDevice = devices.first(where: { $0.uid == savedUID })
-        let currentDevice = devices.first(where: { $0.id == selectedDeviceID })
-        selectedDeviceID = savedDevice?.id ?? currentDevice?.id ?? Self.defaultInputDevice() ?? devices.first?.id ?? 0
-        updateChannels()
+        if let route {
+            checkRoute()
+            if self.route === route { updateChannels() }
+            return
+        }
+        guard recovery == nil else { return }
+        let preferredUID = defaults.string(forKey: PreferenceKey.deviceUID)
+        let preferredDevice = devices.first { $0.uid == preferredUID }
+        let currentDevice = devices.first { $0.id == selectedDeviceID }
+        let defaultInput = Self.defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+        select(preferredDevice ?? currentDevice ?? devices.first { $0.id == defaultInput } ?? devices.first)
     }
 
-    func selectDevice() {
-        let wasRunning = isMonitoring
+    func selectDevice(_ device: InputDevice) {
+        let resume = route != nil || recovery != nil
+        if route?.input.id == device.id { return }
         stop()
-        updateChannels()
-        if wasRunning { start() }
+        select(device)
+        defaults.set(device.uid, forKey: PreferenceKey.deviceUID)
+        if resume { start() }
     }
 
     func applyChannelConfiguration() {
@@ -91,82 +102,152 @@ final class AudioMonitor: ObservableObject {
     }
 
     func applyVolume() {
-        monitorMixer.outputVolume = volume
+        route?.mixer.outputVolume = volume
     }
 
     func toggleMonitoring() {
-        isMonitoring ? stop() : start()
+        if isMonitoring || isReconnecting { stop() }
+        else { start() }
     }
 
     func stopForSystemSleep() {
-        guard isMonitoring else { return }
         stop()
     }
 
     private func start() {
-        guard selectedDeviceID != 0 else {
+        let selectedUID = devices.first { $0.id == selectedDeviceID }?.uid
+            ?? defaults.string(forKey: PreferenceKey.deviceUID)
+        devices = Self.inputDevices()
+        guard let device = devices.first(where: { $0.uid == selectedUID }) else {
+            select(nil)
             report("Connect an audio input device, then try again.")
             return
         }
+        guard let outputID = Self.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) else {
+            report("Connect an audio output device, then try again.")
+            return
+        }
+        start(input: device, outputID: outputID)
+    }
 
+    private func start(input device: InputDevice, outputID: AudioDeviceID, retryStalledOutput: Bool = true) {
+        select(device)
+        defaults.set(device.uid, forKey: PreferenceKey.deviceUID)
+        let engine = AVAudioEngine()
+        let mixer = AVAudioMixerNode()
+        let input = engine.inputNode
+        let meterState = MeterState()
         do {
-            // This selects the hardware input for the app process. The graph below remains
-            // intentionally short: input node → monitor mixer → selected output device.
-            try setInputDevice(selectedDeviceID)
-            let input = engine.inputNode
-            try applyInputChannelMap(to: input)
-            let hardwareFormat = input.inputFormat(forBus: 0)
-            guard hardwareFormat.channelCount > 0 else {
+            guard let inputUnit = input.audioUnit else {
                 report("The selected device does not expose an input stream.")
                 return
             }
-
-            let outputChannels: AVAudioChannelCount = linkedStereo ? 2 : 1
-            let monitorFormat = AVAudioFormat(
+            try setInputDevice(device.id, on: inputUnit)
+            try applyInputChannelMap(to: inputUnit)
+            let hardwareFormat = input.inputFormat(forBus: 0)
+            guard hardwareFormat.channelCount > 0, hardwareFormat.sampleRate > 0 else {
+                report("The selected device does not expose an input stream.")
+                return
+            }
+            let output = engine.outputNode
+            let outputFormat = output.outputFormat(forBus: 0)
+            guard outputFormat.channelCount > 0, outputFormat.sampleRate > 0 else {
+                report("The selected output device does not expose an audio stream.")
+                return
+            }
+            guard let monitorFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
                 sampleRate: hardwareFormat.sampleRate,
-                channels: outputChannels,
+                channels: linkedStereo ? 2 : 1,
                 interleaved: false
-            )!
+            ) else {
+                report("The selected input format could not be configured.")
+                return
+            }
 
-            engine.disconnectNodeOutput(input)
-            engine.disconnectNodeInput(monitorMixer)
-            engine.disconnectNodeOutput(monitorMixer)
-
-            // AVAudioEngine's input node follows the chosen device. A connection to a
-            // mono/stereo mixer establishes the channel layout; the device's native input
-            // is used so Core Audio does not add a sample-rate conversion stage.
-            engine.connect(input, to: monitorMixer, format: monitorFormat)
-            engine.connect(monitorMixer, to: engine.outputNode, format: nil)
-            monitorMixer.outputVolume = volume
-            installLevelMeter(from: input)
+            engine.attach(mixer)
+            engine.connect(input, to: mixer, format: monitorFormat)
+            engine.connect(mixer, to: output, format: nil)
+            mixer.outputVolume = volume
+            input.installTap(onBus: 0, bufferSize: 1_024, format: nil, block: Self.makeMeterTap(state: meterState))
             try engine.start()
+            route = MonitorRoute(engine: engine, mixer: mixer, meterState: meterState,
+                                 input: device, outputID: outputID, retryStalledOutput: retryStalledOutput)
             isMonitoring = true
         } catch {
-            stop()
+            engine.stop()
             report("Could not start monitoring: \(error.localizedDescription)")
         }
     }
 
     private func stop() {
-        monitorMixer.removeTap(onBus: 0)
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        recovery?.cancel()
+        recovery = nil
+        route?.engine.stop()
+        route?.engine.inputNode.removeTap(onBus: 0)
+        route = nil
         isMonitoring = false
+        isReconnecting = false
         leftOutputLevel = 0
         rightOutputLevel = 0
-        meterState.store(left: 0, right: 0)
     }
 
-    private func installLevelMeter(from input: AVAudioInputNode) {
-        // Tapping the input node keeps the mixer → output route completely untouched.
-        // The displayed level is scaled with the monitor level below.
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1_024, format: nil, block: Self.makeMeterTap(state: meterState))
+    private func checkRoute() {
+        guard let route else { return }
+        if !Self.deviceIsAlive(route.input.id) || !Self.deviceIsAlive(route.outputID)
+            || Self.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != route.outputID {
+            recoverRoute(input: route.input, outputID: route.outputID)
+            return
+        }
+
+        // The input meter can run without playback. The mixer only renders when the
+        // output pulls audio from it, even when the instrument is silent.
+        if let time = route.mixer.lastRenderTime, time.isSampleTimeValid, time.sampleTime != route.lastRenderSample {
+            if route.lastRenderSample != nil { route.retryStalledOutput = true }
+            route.lastRenderSample = time.sampleTime
+            route.lastRender = .now
+        }
+        guard !route.engine.isRunning || route.lastRender.duration(to: .now) >= .seconds(2) else { return }
+        if route.retryStalledOutput {
+            recoverRoute(input: route.input, outputID: route.outputID)
+        } else {
+            stop()
+            report("The audio output stopped rendering. Check the system output and enable monitoring again.")
+        }
+    }
+
+    private func recoverRoute(input: InputDevice, outputID: AudioDeviceID) {
+        stop()
+        isReconnecting = true
+        recovery = Task { [weak self] in
+            for _ in 0..<30 {
+                do { try await Task.sleep(for: .milliseconds(500)) }
+                catch { return }
+                guard let self else { return }
+                let availableInputs = Self.inputDevices()
+                guard let device = availableInputs.first(where: { $0.uid == input.uid }),
+                      let output = Self.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice),
+                      Self.deviceIsAlive(output) else { continue }
+                // If the interface was both input and output, wait for macOS to
+                // restore it after reconnecting instead of playing to a fallback.
+                if input.id == outputID, device.id != input.id, output != device.id { continue }
+                self.recovery = nil
+                self.isReconnecting = false
+                self.devices = availableInputs
+                self.start(input: device, outputID: output, retryStalledOutput: false)
+                return
+            }
+            guard let self else { return }
+            self.recovery = nil
+            self.isReconnecting = false
+            self.devices = Self.inputDevices()
+            self.select(self.devices.first { $0.uid == input.uid })
+            self.report("The audio connection could not be restored. Check your audio devices and enable monitoring again.")
+        }
     }
 
     private func refreshMeter() {
-        let measuredLevel = meterState.load()
+        guard let measuredLevel = route?.meterState.load() else { return }
         // Fast attack, slower release: a familiar analog meter response.
         leftOutputLevel = max(measuredLevel.left * volume, leftOutputLevel * 0.82)
         rightOutputLevel = max(measuredLevel.right * volume, rightOutputLevel * 0.82)
@@ -188,11 +269,13 @@ final class AudioMonitor: ObservableObject {
 
     private func updateChannels() {
         let channelCount = devices.first(where: { $0.id == selectedDeviceID })?.inputChannels ?? 0
-        availableChannels = Array(1...max(0, channelCount))
+        availableChannels = (0..<channelCount).map { $0 + 1 }
+        guard channelCount > 0 else { return }
         if !availableChannels.contains(selectedChannel) {
             selectedChannel = availableChannels.first ?? 1
         }
         if channelCount < 2 { linkedStereo = false }
+        if linkedStereo, selectedChannel == channelCount { selectedChannel = channelCount - 1 }
     }
 
     var canLinkStereo: Bool { availableChannels.count >= 2 }
@@ -205,9 +288,30 @@ final class AudioMonitor: ObservableObject {
         showError = true
     }
 
-    private func saveSelectedDevice() {
-        guard let device = devices.first(where: { $0.id == selectedDeviceID }) else { return }
-        defaults.set(device.uid, forKey: PreferenceKey.deviceUID)
+    private func select(_ device: InputDevice?) {
+        selectedDeviceID = device?.id ?? 0
+        updateChannels()
+    }
+}
+
+private final class MonitorRoute {
+    let engine: AVAudioEngine
+    let mixer: AVAudioMixerNode
+    let meterState: MeterState
+    let input: InputDevice
+    let outputID: AudioDeviceID
+    var lastRender = ContinuousClock.now
+    var lastRenderSample: AVAudioFramePosition?
+    var retryStalledOutput: Bool
+
+    init(engine: AVAudioEngine, mixer: AVAudioMixerNode, meterState: MeterState,
+         input: InputDevice, outputID: AudioDeviceID, retryStalledOutput: Bool) {
+        self.engine = engine
+        self.mixer = mixer
+        self.meterState = meterState
+        self.input = input
+        self.outputID = outputID
+        self.retryStalledOutput = retryStalledOutput
     }
 }
 
@@ -238,16 +342,27 @@ private final class MeterState: @unchecked Sendable {
 }
 
 private extension AudioMonitor {
-    static func defaultInputDevice() -> AudioDeviceID? {
+    static func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID? {
         var deviceID = AudioDeviceID()
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
         return status == noErr && deviceID != kAudioObjectUnknown ? deviceID : nil
+    }
+
+    static func deviceIsAlive(_ id: AudioDeviceID) -> Bool {
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout.size(ofValue: alive))
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        return AudioObjectGetPropertyData(id, &address, 0, nil, &size, &alive) == noErr && alive != 0
     }
 
     static func inputDevices() -> [InputDevice] {
@@ -330,10 +445,10 @@ private extension AudioMonitor {
         return status == noErr ? (uid?.takeUnretainedValue() as String? ?? "device-\(id)") : "device-\(id)"
     }
 
-    func setInputDevice(_ id: AudioDeviceID) throws {
+    func setInputDevice(_ id: AudioDeviceID, on inputUnit: AudioUnit) throws {
         var mutableID = id
         let status = AudioUnitSetProperty(
-            engine.inputNode.audioUnit!,
+            inputUnit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
             0,
@@ -345,7 +460,7 @@ private extension AudioMonitor {
         }
     }
 
-    func applyInputChannelMap(to input: AVAudioInputNode) throws {
+    func applyInputChannelMap(to inputUnit: AudioUnit) throws {
         // The AUHAL input node exposes captured channels on output scope / element 1.
         // A channel map keeps channel selection in Core Audio, before the monitor graph,
         // rather than adding an app-level buffer/copy in the render callback.
@@ -354,7 +469,7 @@ private extension AudioMonitor {
             ? [Int32(selectedChannel - 1), Int32(selectedChannel)]
             : [Int32(selectedChannel - 1)]
         let status = AudioUnitSetProperty(
-            input.audioUnit!,
+            inputUnit,
             kAudioOutputUnitProperty_ChannelMap,
             kAudioUnitScope_Output,
             1,
