@@ -9,10 +9,10 @@ Hear your instrument and play along with your favourite music—without opening 
 ## Interface
 
 <p align="center">
-  <img src="Assets/interface-preview.png" width="360" alt="Simple Audio Monitor with audio input selection, turquoise Monitor and violet Other apps faders, individual enable buttons, and stereo signal meters">
+  <img src="Assets/interface-preview.png" width="360" alt="Simple Audio Monitor with the M2 selected, an enlarged input refresh button, and green and amber stereo LED meters">
 </p>
 
-The current interface, shown in standby with an M2 audio interface selected. **Monitor** controls your instrument; **Other apps** controls music and playback on your current default output. Each panel has its own **Enable** button.
+The interface shown with an M2 selected and example stereo signal levels. **Monitor** controls your instrument. **Other apps** controls music and playback on your current default output. Each panel has its own **Enable** button.
 
 ## Get started
 
